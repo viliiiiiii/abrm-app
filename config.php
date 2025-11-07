@@ -36,9 +36,9 @@ define('APPS_DSN', getenv('APPS_DSN') ?: sprintf('mysql:host=%s;dbname=%s;charse
 define('APPS_DB_USER', getenv('APPS_DB_USER') ?: DB_USER);
 define('APPS_DB_PASS', getenv('APPS_DB_PASS') ?: DB_PASS);
 
-define('CORE_DSN', 'mysql:host=127.0.0.1;dbname=core_db;charset=utf8mb4');
-define('CORE_DB_USER', 'core_user');
-define('CORE_DB_PASS', 'core123');
+define('CORE_DSN', getenv('CORE_DSN') ?: 'mysql:host=127.0.0.1;dbname=core_db;charset=utf8mb4');
+define('CORE_DB_USER', getenv('CORE_DB_USER') ?: 'core_user');
+define('CORE_DB_PASS', getenv('CORE_DB_PASS') ?: 'core123');
 // Security hardening
 define('APP_FORCE_HTTPS', false); // set true when site is behind HTTPS
 define('APP_HSTS_MAX_AGE', 31536000); // one year

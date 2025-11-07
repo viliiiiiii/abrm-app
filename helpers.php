@@ -1126,14 +1126,26 @@ if (!defined('HELPERS_BOOTSTRAPPED')) {
         return null;
     }
 
-    function core_sync_legacy_user(PDO $core, array $legacy): void {
+    function core_sync_legacy_user(PDO $core, array $legacy, ?string $plainPassword = null): void {
         $email = trim((string)($legacy['email'] ?? ''));
         if ($email === '') {
             return;
         }
 
-        $password = (string)($legacy['pass_hash'] ?? $legacy['password_hash'] ?? '');
-        if ($password === '') {
+        $legacyHash = (string)($legacy['pass_hash'] ?? $legacy['password_hash'] ?? '');
+        $hashToStore = $legacyHash;
+
+        if ($plainPassword !== null) {
+            try {
+                if ($legacyHash === '' || password_needs_rehash($legacyHash, PASSWORD_DEFAULT)) {
+                    $hashToStore = password_hash($plainPassword, PASSWORD_DEFAULT);
+                }
+            } catch (Throwable $e) {
+                $hashToStore = password_hash($plainPassword, PASSWORD_DEFAULT);
+            }
+        }
+
+        if ($hashToStore === '') {
             return;
         }
 
@@ -1151,10 +1163,29 @@ if (!defined('HELPERS_BOOTSTRAPPED')) {
 
         $stmt->execute([
             ':email'     => $email,
-            ':pass_hash' => $password,
+            ':pass_hash' => $hashToStore,
             ':role_id'   => $roleId,
             ':sector_id' => $sector,
         ]);
+    }
+
+
+    function core_update_password_hash(PDO $core, int $userId, string $newHash): void {
+        if ($userId <= 0 || $newHash === '') {
+            return;
+        }
+
+        try {
+            $stmt = $core->prepare('UPDATE users SET pass_hash = :hash WHERE id = :id');
+            $stmt->execute([
+                ':hash' => $newHash,
+                ':id'   => $userId,
+            ]);
+        } catch (Throwable $e) {
+            try {
+                error_log('Failed to refresh CORE password hash: ' . $e->getMessage());
+            } catch (Throwable $_) {}
+        }
     }
 
     function core_resolve_role_id(PDO $core, ?string $legacyRole): int {

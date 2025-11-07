@@ -21,6 +21,17 @@ function attempt_login(string $email, string $password): bool {
 
     $user = core_find_user_by_email($email, true);
     if ($user && !empty($user['pass_hash']) && password_verify($password, (string)$user['pass_hash'])) {
+        if (!empty($user['pass_hash']) && password_needs_rehash((string)$user['pass_hash'], PASSWORD_DEFAULT)) {
+            try {
+                $newHash = password_hash($password, PASSWORD_DEFAULT);
+                core_update_password_hash($core, (int)$user['id'], $newHash);
+            } catch (Throwable $e) {
+                try {
+                    error_log('Failed to refresh CORE password hash for user ' . (int)$user['id'] . ': ' . $e->getMessage());
+                } catch (Throwable $_) {}
+            }
+        }
+
         auth_login((int)$user['id']);
         enforce_not_suspended();
         log_event('login', 'user', (int)$user['id'], ['source' => 'core']);
@@ -33,7 +44,7 @@ function attempt_login(string $email, string $password): bool {
     }
 
     try {
-        core_sync_legacy_user($core, $legacy);
+        core_sync_legacy_user($core, $legacy, $password);
         $user = core_find_user_by_email($email, true, true);
     } catch (Throwable $e) {
         try {
