@@ -4,102 +4,52 @@ declare(strict_types=1);
 require_once __DIR__ . '/helpers.php';
 
 /**
- * Attempt login using CORE users first (core_db.users).
- * Falls back to legacy punchlist.users (apps DB) once, and auto-seeds CORE.
+ * Attempt login using the CORE database as the source of truth.
+ * When a matching legacy record is found, it is synchronised into CORE
+ * before completing authentication.
  */
 function attempt_login(string $email, string $password): bool {
     $email = trim($email);
-    if ($email === '' || $password === '') return false;
+    if ($email === '' || $password === '') {
+        return false;
+    }
 
-    // --- 1) CORE auth
-    $user = core_find_user_by_email($email);
+    $core = core_pdo_optional();
+    if (!$core) {
+        throw new RuntimeException('Authentication service is unavailable. Please contact your administrator.');
+    }
+
+    $user = core_find_user_by_email($email, true);
     if ($user && !empty($user['pass_hash']) && password_verify($password, (string)$user['pass_hash'])) {
         auth_login((int)$user['id']);
         enforce_not_suspended();
-        log_event('login', 'user', (int)$user['id']);
+        log_event('login', 'user', (int)$user['id'], ['source' => 'core']);
         return true;
     }
 
-    // --- 2) Legacy fallback (apps DB) — optional one-time bridge
-    try {
-        $pdo = get_pdo('apps');
-        $passwordColumn = apps_users_password_column($pdo);
-        if ($passwordColumn !== null) {
-            $sql = sprintf(
-                'SELECT id, email, role, %s AS pass_hash FROM users WHERE email = ? LIMIT 1',
-                $passwordColumn
-            );
-            $st = $pdo->prepare($sql);
-            $st->execute([$email]);
-            $legacy = $st->fetch();
-        } else {
-            $legacy = null;
-        }
-    } catch (Throwable $e) {
-        $legacy = null;
+    $legacy = legacy_find_user_by_email($email);
+    if (!$legacy || empty($legacy['pass_hash']) || !password_verify($password, (string)$legacy['pass_hash'])) {
+        return false;
     }
 
-    if ($legacy && !empty($legacy['pass_hash']) && password_verify($password, (string)$legacy['pass_hash'])) {
-        // Seed into CORE if missing, default to 'admin' role (fallback to first role if admin missing)
-        $core = core_pdo_optional();
-        if ($core) {
-            try {
-                $roleId = (int)($core->query("SELECT id FROM roles WHERE key_slug='admin'")->fetchColumn() ?: 0);
-                if (!$roleId) {
-                    $roleId = (int)($core->query("SELECT id FROM roles LIMIT 1")->fetchColumn() ?: 0);
-                }
-                if ($roleId) {
-                    $ins = $core->prepare("INSERT IGNORE INTO users (email, pass_hash, role_id) VALUES (?, ?, ?)");
-                    $ins->execute([$legacy['email'], $legacy['pass_hash'], $roleId]);
-                }
-                // Fetch the now-seeded CORE user
-                $user = core_find_user_by_email($email);
-                if ($user) {
-                    auth_login((int)$user['id']);
-                    log_event('login', 'user', (int)$user['id'], ['source' => 'legacy_seed']);
-                    return true;
-                }
-            } catch (Throwable $e) {
-                // If CORE unavailable, keep legacy session for compatibility (not ideal)
-            }
-        }
+    try {
+        core_sync_legacy_user($core, $legacy);
+        $user = core_find_user_by_email($email, true, true);
+    } catch (Throwable $e) {
+        try {
+            error_log('CORE sync failure during login: ' . $e->getMessage());
+        } catch (Throwable $_) {}
+        throw new RuntimeException('Unable to upgrade account into the CORE directory. Please contact your administrator.', 0, $e);
+    }
 
-        // Last-resort: legacy session payload (avoid if possible, but keeps the app usable)
-        $_SESSION['user'] = [
-            'id'        => (int)$legacy['id'],
-            'email'     => (string)$legacy['email'],
-            'role'      => (string)($legacy['role'] ?? ''),
-            'role_key'  => (string)($legacy['role'] ?? ''),
-            'role_slug' => (string)($legacy['role'] ?? ''),
-        ];
-        log_event('login', 'user', (int)$legacy['id'], ['source' => 'legacy_session']);
+    if ($user && !empty($user['id'])) {
+        auth_login((int)$user['id']);
+        enforce_not_suspended();
+        log_event('login', 'user', (int)$user['id'], ['source' => 'legacy-sync']);
         return true;
     }
 
     return false;
-}
-
-function apps_users_password_column(PDO $pdo): ?string {
-    static $cache = null;
-    if ($cache !== null) {
-        return $cache;
-    }
-
-    try {
-        $stmt = $pdo->query("SHOW COLUMNS FROM users LIKE 'pass_hash'");
-        if ($stmt && $stmt->fetch()) {
-            return $cache = 'pass_hash';
-        }
-
-        $stmt = $pdo->query("SHOW COLUMNS FROM users LIKE 'password_hash'");
-        if ($stmt && $stmt->fetch()) {
-            return $cache = 'password_hash';
-        }
-    } catch (Throwable $e) {
-        // ignore and fall through to null
-    }
-
-    return $cache = null;
 }
 
 /** Sign the user out and redirect */
