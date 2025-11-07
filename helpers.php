@@ -86,30 +86,22 @@ if (!defined('HELPERS_BOOTSTRAPPED')) {
 
         if (isset($failures[$which])) {
             $previous = $failures[$which];
-            if ($which === 'apps' || !$allowFallback) {
-                if ($previous instanceof Throwable) {
-                    throw new RuntimeException(
-                        'Database connection previously failed: ' . $previous->getMessage(),
-                        0,
-                        $previous
-                    );
-                }
+            $message  = $previous instanceof Throwable ? $previous->getMessage() : 'Unknown error';
 
-                throw new RuntimeException('Database connection previously failed.');
-            }
-
-            return $pool[$which] = get_pdo('apps', $allowFallback);
+            throw new RuntimeException(
+                sprintf('Database connection previously failed for "%s": %s', $which, $message),
+                0,
+                $previous instanceof Throwable ? $previous : null
+            );
         }
 
-        if ($which === 'core') {
-            $dsn  = CORE_DSN;
-            $user = CORE_DB_USER;
-            $pass = CORE_DB_PASS;
-        } else {
-            $dsn  = APPS_DSN;
-            $user = APPS_DB_USER;
-            $pass = APPS_DB_PASS;
-        }
+        $config = match ($which) {
+            'core' => [CORE_DSN, CORE_DB_USER, CORE_DB_PASS],
+            'apps', 'default' => [APPS_DSN, APPS_DB_USER, APPS_DB_PASS],
+            default => throw new InvalidArgumentException('Unknown database pool: ' . $which),
+        };
+
+        [$dsn, $user, $pass] = $config;
 
         $options = [
             PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
@@ -118,36 +110,41 @@ if (!defined('HELPERS_BOOTSTRAPPED')) {
         ];
 
         if (defined('PDO::ATTR_TIMEOUT')) {
-            $options[PDO::ATTR_TIMEOUT] = 2;
+            $options[PDO::ATTR_TIMEOUT] = 3;
+        }
+
+        if (defined('PDO::MYSQL_ATTR_FOUND_ROWS')) {
+            $options[PDO::MYSQL_ATTR_FOUND_ROWS] = true;
         }
 
         try {
             $pdo = new PDO($dsn, $user, $pass, $options);
+
+            try {
+                $pdo->exec("SET NAMES 'utf8mb4' COLLATE 'utf8mb4_unicode_ci'");
+            } catch (Throwable $_) {
+                // collation hints are best-effort
+            }
+
             return $pool[$which] = $pdo;
         } catch (Throwable $e) {
             $failures[$which] = $e;
 
-            if ($which !== 'apps') {
-                try {
-                    error_log('get_pdo failed for ' . $which . ': ' . $e->getMessage());
-                } catch (Throwable $_) {}
+            try {
+                error_log(sprintf('Database pool "%s" connection failed: %s', $which, $e->getMessage()));
+            } catch (Throwable $_) {}
 
-                if (!$allowFallback) {
-                    if ($e instanceof Throwable) {
-                        throw new RuntimeException('Unable to connect to database: ' . $e->getMessage(), 0, $e);
-                    }
-
-                    throw new RuntimeException('Unable to connect to database.');
-                }
-
-                return $pool[$which] = get_pdo('apps', $allowFallback);
-            }
-
-            if ($e instanceof RuntimeException) {
-                throw $e;
-            }
-
-            throw new RuntimeException('Unable to connect to database: ' . $e->getMessage(), 0, $e);
+            throw new RuntimeException(
+                sprintf(
+                    'Unable to connect to the %s database. %s',
+                    strtoupper($which),
+                    $which === 'core'
+                        ? 'Authentication and permissions require the CORE database; fallback has been disabled.'
+                        : 'Please verify credentials and availability.'
+                ),
+                0,
+                $e instanceof Throwable ? $e : null
+            );
         }
     }
 
@@ -997,7 +994,7 @@ if (!defined('HELPERS_BOOTSTRAPPED')) {
      * Primary lookup: find a CORE user by email.
      * Returns role/sector slugs if available.
      */
-    function core_find_user_by_email(string $email): ?array {
+    function core_find_user_by_email(string $email, bool $coreOnly = false, bool $attemptedSync = false): ?array {
         $email = trim($email);
         if ($email === '') {
             return null;
@@ -1021,8 +1018,43 @@ if (!defined('HELPERS_BOOTSTRAPPED')) {
                     return $u;
                 }
             } catch (Throwable $e) {
-                // fall through to local lookup
+                if ($coreOnly) {
+                    throw new RuntimeException('Authentication query failed. Please try again shortly.', 0, $e);
+                }
             }
+        }
+
+        if ($coreOnly) {
+            return null;
+        }
+
+        $legacy = legacy_find_user_by_email($email);
+        if (!$legacy) {
+            return null;
+        }
+
+        $core = core_pdo_optional();
+        if ($core && !$attemptedSync) {
+            try {
+                core_sync_legacy_user($core, $legacy);
+                $synced = core_find_user_by_email($email, true, true);
+                if ($synced) {
+                    return $synced;
+                }
+            } catch (Throwable $e) {
+                try {
+                    error_log('Legacy user sync failed: ' . $e->getMessage());
+                } catch (Throwable $_) {}
+            }
+        }
+
+        return $legacy;
+    }
+
+    function legacy_find_user_by_email(string $email): ?array {
+        $email = trim($email);
+        if ($email === '') {
+            return null;
         }
 
         try {
@@ -1030,23 +1062,238 @@ if (!defined('HELPERS_BOOTSTRAPPED')) {
             $st   = $apps->prepare('SELECT * FROM users WHERE email = ? LIMIT 1');
             $st->execute([$email]);
             $row = $st->fetch(PDO::FETCH_ASSOC);
-            if ($row) {
-                if (!isset($row['role_slug']) && isset($row['role'])) {
-                    $row['role_slug'] = $row['role'];
-                }
-                if (!isset($row['role_key']) && isset($row['role'])) {
-                    $row['role_key'] = $row['role'];
-                }
-                if (!isset($row['pass_hash']) && isset($row['password_hash'])) {
-                    $row['pass_hash'] = $row['password_hash'];
-                }
-                return $row;
+            if (!$row) {
+                return null;
             }
-        } catch (Throwable $inner) {
-            // ignore and return null below
+
+            if (!isset($row['role_slug']) && isset($row['role'])) {
+                $row['role_slug'] = $row['role'];
+            }
+            if (!isset($row['role_key']) && isset($row['role'])) {
+                $row['role_key'] = $row['role'];
+            }
+            if (!isset($row['pass_hash']) && isset($row['password_hash'])) {
+                $row['pass_hash'] = $row['password_hash'];
+            }
+            if (!isset($row['sector_slug']) && isset($row['sector_key'])) {
+                $row['sector_slug'] = $row['sector_key'];
+            }
+
+            return $row;
+        } catch (Throwable $e) {
+            try {
+                error_log('Legacy user lookup failed: ' . $e->getMessage());
+            } catch (Throwable $_) {}
         }
 
         return null;
+    }
+
+    function legacy_find_user_by_id(int $id): ?array {
+        if ($id <= 0) {
+            return null;
+        }
+
+        try {
+            $apps = get_pdo();
+            $stmt = $apps->prepare('SELECT * FROM users WHERE id = ? LIMIT 1');
+            $stmt->execute([$id]);
+            $row = $stmt->fetch(PDO::FETCH_ASSOC);
+            if (!$row) {
+                return null;
+            }
+
+            if (!isset($row['role_slug']) && isset($row['role'])) {
+                $row['role_slug'] = $row['role'];
+            }
+            if (!isset($row['role_key']) && isset($row['role'])) {
+                $row['role_key'] = $row['role'];
+            }
+            if (!isset($row['pass_hash']) && isset($row['password_hash'])) {
+                $row['pass_hash'] = $row['password_hash'];
+            }
+            if (!isset($row['sector_slug']) && isset($row['sector_key'])) {
+                $row['sector_slug'] = $row['sector_key'];
+            }
+
+            return $row;
+        } catch (Throwable $e) {
+            try {
+                error_log('Legacy user lookup by id failed: ' . $e->getMessage());
+            } catch (Throwable $_) {}
+        }
+
+        return null;
+    }
+
+    function core_sync_legacy_user(PDO $core, array $legacy, ?string $plainPassword = null): void {
+        $email = trim((string)($legacy['email'] ?? ''));
+        if ($email === '') {
+            return;
+        }
+
+        $legacyHash = (string)($legacy['pass_hash'] ?? $legacy['password_hash'] ?? '');
+        $hashToStore = $legacyHash;
+
+        if ($plainPassword !== null) {
+            try {
+                if ($legacyHash === '' || password_needs_rehash($legacyHash, PASSWORD_DEFAULT)) {
+                    $hashToStore = password_hash($plainPassword, PASSWORD_DEFAULT);
+                }
+            } catch (Throwable $e) {
+                $hashToStore = password_hash($plainPassword, PASSWORD_DEFAULT);
+            }
+        }
+
+        if ($hashToStore === '') {
+            return;
+        }
+
+        $roleSlug = (string)($legacy['role_slug'] ?? $legacy['role_key'] ?? $legacy['role'] ?? '');
+        $sectorId = $legacy['sector_id'] ?? null;
+
+        $roleId = core_resolve_role_id($core, $roleSlug);
+        $sector = core_resolve_sector_id($core, $sectorId, $legacy['sector_slug'] ?? null);
+
+        $stmt = $core->prepare(
+            'INSERT INTO users (email, pass_hash, role_id, sector_id)
+             VALUES (:email, :pass_hash, :role_id, :sector_id)
+             ON DUPLICATE KEY UPDATE pass_hash = VALUES(pass_hash), role_id = VALUES(role_id), sector_id = VALUES(sector_id)'
+        );
+
+        $stmt->execute([
+            ':email'     => $email,
+            ':pass_hash' => $hashToStore,
+            ':role_id'   => $roleId,
+            ':sector_id' => $sector,
+        ]);
+    }
+
+
+    function core_update_password_hash(PDO $core, int $userId, string $newHash): void {
+        if ($userId <= 0 || $newHash === '') {
+            return;
+        }
+
+        try {
+            $stmt = $core->prepare('UPDATE users SET pass_hash = :hash WHERE id = :id');
+            $stmt->execute([
+                ':hash' => $newHash,
+                ':id'   => $userId,
+            ]);
+        } catch (Throwable $e) {
+            try {
+                error_log('Failed to refresh CORE password hash: ' . $e->getMessage());
+            } catch (Throwable $_) {}
+        }
+    }
+
+    function core_resolve_role_id(PDO $core, ?string $legacyRole): int {
+        $candidates = [];
+        $legacyRole = is_string($legacyRole) ? trim($legacyRole) : '';
+        if ($legacyRole !== '') {
+            $candidates[] = strtolower($legacyRole);
+        }
+
+        if ($legacyRole === 'administrator') {
+            $candidates[] = 'admin';
+        }
+
+        $candidates = array_unique(array_merge($candidates, ['admin', 'viewer', 'root']));
+
+        foreach ($candidates as $slug) {
+            $id = core_lookup_role_id($core, $slug);
+            if ($id) {
+                return $id;
+            }
+        }
+
+        $stmt = $core->query('SELECT id FROM roles ORDER BY id LIMIT 1');
+        $fallback = (int)($stmt ? $stmt->fetchColumn() : 0);
+        if ($fallback <= 0) {
+            throw new RuntimeException('No roles configured in CORE database.');
+        }
+
+        return $fallback;
+    }
+
+    function core_lookup_role_id(PDO $core, string $slug): ?int {
+        $slug = strtolower(trim($slug));
+        if ($slug === '') {
+            return null;
+        }
+
+        static $cache = [];
+        if (array_key_exists($slug, $cache)) {
+            return $cache[$slug];
+        }
+
+        $stmt = $core->prepare('SELECT id FROM roles WHERE key_slug = :slug LIMIT 1');
+        $stmt->execute([':slug' => $slug]);
+        $id = $stmt->fetchColumn();
+
+        return $cache[$slug] = $id ? (int)$id : null;
+    }
+
+    function core_resolve_sector_id(PDO $core, $sectorId, $sectorSlug = null): ?int {
+        $candidates = [];
+        if ($sectorId !== null && $sectorId !== '') {
+            $candidates[] = (int)$sectorId;
+        }
+        if ($sectorSlug !== null && $sectorSlug !== '') {
+            $candidates[] = (string)$sectorSlug;
+        }
+
+        foreach ($candidates as $candidate) {
+            if (is_int($candidate)) {
+                $id = core_lookup_sector_id_by_id($core, $candidate);
+                if ($id !== null) {
+                    return $id;
+                }
+            } elseif (is_string($candidate)) {
+                $id = core_lookup_sector_id_by_slug($core, $candidate);
+                if ($id !== null) {
+                    return $id;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    function core_lookup_sector_id_by_id(PDO $core, int $id): ?int {
+        if ($id <= 0) {
+            return null;
+        }
+
+        static $cache = [];
+        if (array_key_exists($id, $cache)) {
+            return $cache[$id];
+        }
+
+        $stmt = $core->prepare('SELECT id FROM sectors WHERE id = :id LIMIT 1');
+        $stmt->execute([':id' => $id]);
+        $found = $stmt->fetchColumn();
+
+        return $cache[$id] = $found ? (int)$found : null;
+    }
+
+    function core_lookup_sector_id_by_slug(PDO $core, string $slug): ?int {
+        $slug = strtolower(trim($slug));
+        if ($slug === '') {
+            return null;
+        }
+
+        static $cache = [];
+        if (array_key_exists($slug, $cache)) {
+            return $cache[$slug];
+        }
+
+        $stmt = $core->prepare('SELECT id FROM sectors WHERE key_slug = :slug LIMIT 1');
+        $stmt->execute([':slug' => $slug]);
+        $found = $stmt->fetchColumn();
+
+        return $cache[$slug] = $found ? (int)$found : null;
     }
 
     /**
@@ -1070,31 +1317,35 @@ if (!defined('HELPERS_BOOTSTRAPPED')) {
                 $stmt->execute([$userId]);
                 $row = $stmt->fetch();
                 if ($row) {
-                    $cache[$userId] = $row;
-                    return $row;
+                    return $cache[$userId] = $row;
                 }
             } catch (Throwable $e) {
-                // ignore and attempt local fallback
+                try {
+                    error_log('CORE user lookup failed: ' . $e->getMessage());
+                } catch (Throwable $_) {}
             }
         }
 
-        try {
-            $apps = get_pdo();
-            $stmt = $apps->prepare('SELECT * FROM users WHERE id = ? LIMIT 1');
-            $stmt->execute([$userId]);
-            $row = $stmt->fetch(PDO::FETCH_ASSOC);
-            if ($row) {
-                if (!isset($row['role_key']) && isset($row['role'])) {
-                    $row['role_key'] = $row['role'];
+        $legacy = legacy_find_user_by_id($userId);
+        if ($legacy) {
+            if ($pdo) {
+                try {
+                    core_sync_legacy_user($pdo, $legacy);
+
+                    $stmt = $pdo->prepare('SELECT u.*, r.key_slug AS role_key FROM users u JOIN roles r ON r.id = u.role_id WHERE u.id = ?');
+                    $stmt->execute([$userId]);
+                    $synced = $stmt->fetch();
+                    if ($synced) {
+                        return $cache[$userId] = $synced;
+                    }
+                } catch (Throwable $e) {
+                    try {
+                        error_log('Unable to synchronise legacy user into CORE: ' . $e->getMessage());
+                    } catch (Throwable $_) {}
                 }
-                if (!isset($row['pass_hash']) && isset($row['password_hash'])) {
-                    $row['pass_hash'] = $row['password_hash'];
-                }
-                $cache[$userId] = $row;
-                return $row;
             }
-        } catch (Throwable $inner) {
-            // ignore failure
+
+            return $cache[$userId] = $legacy;
         }
 
         $cache[$userId] = null;
